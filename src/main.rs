@@ -20,14 +20,24 @@ struct Opt {
     date: Option<String>,
     #[structopt(long, help = "Project key")]
     project: Option<String>,
+    #[structopt(long, help = "Show business value (true) or customer value (false)")]
+    show_business_value: Option<bool>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     onboarding();
 
-    loop {
+    let value_types = vec!["Business Value", "Customer Value"];
+    let value_selection = Select::new()
+        .with_prompt("Select which value type to display")
+        .default(0)
+        .items(&value_types)
+        .interact()?;
+    
+    let show_business_value = value_selection == 0;
 
+    loop {
         let menu_options = vec![
             "Select tickets based on sprint",
             "Select tickets based on date range",
@@ -41,8 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .interact()?;
 
         match selection {
-            0 => select_tickets_based_on_sprint()?,
-            1 => select_tickets_based_on_date_range()?,
+            0 => select_tickets_based_on_sprint(show_business_value)?,
+            1 => select_tickets_based_on_date_range(show_business_value)?,
             2 => break,
             _ => unreachable!(),
         }
@@ -77,15 +87,15 @@ fn onboarding() {
     }
 }
 
-fn select_tickets_based_on_sprint() -> Result<(), Box<dyn std::error::Error>> {
+fn select_tickets_based_on_sprint(show_business_value: bool) -> Result<(), Box<dyn std::error::Error>> {
     let sprint_id: String = Input::new()
         .with_prompt("Enter Sprint ID")
         .interact_text()?;
 
-    fetch_and_display_tickets(Some(sprint_id), None, None)
+    fetch_and_display_tickets(Some(sprint_id), None, None, show_business_value)
 }
 
-fn select_tickets_based_on_date_range() -> Result<(), Box<dyn std::error::Error>> {
+fn select_tickets_based_on_date_range(show_business_value: bool) -> Result<(), Box<dyn std::error::Error>> {
     let date_range: String = Input::new()
         .with_prompt("Enter date range in the format 'YYYY/MM/DD,YYYY/MM/DD'")
         .interact_text()?;
@@ -94,10 +104,15 @@ fn select_tickets_based_on_date_range() -> Result<(), Box<dyn std::error::Error>
         .with_prompt("Enter project key")
         .interact_text()?;
 
-    fetch_and_display_tickets(None, Some(date_range), Some(project_key))
+    fetch_and_display_tickets(None, Some(date_range), Some(project_key), show_business_value)
 }
 
-fn fetch_and_display_tickets(sprint: Option<String>, date_range: Option<String>, project: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn fetch_and_display_tickets(
+    sprint: Option<String>, 
+    date_range: Option<String>, 
+    project: Option<String>,
+    show_business_value: bool
+) -> Result<(), Box<dyn std::error::Error>> {
     let jira_base_url = env::var("JIRA_BASE_URL")?;
     let email = env::var("JIRA_EMAIL")?;
     let api_token = env::var("JIRA_API_TOKEN")?;
@@ -149,17 +164,28 @@ fn fetch_and_display_tickets(sprint: Option<String>, date_range: Option<String>,
             let fields = issue.get("fields").unwrap_or(&Value::Null);
             let title = fields.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             let description_string = fields.get("description").map_or("".to_string(), |d| parse_description(d));
-            let business_value_content = extract_business_value_content(&description_string);
+            let value_content = if show_business_value {
+                extract_business_value_content(&description_string)
+            } else {
+                extract_customer_value_content(&description_string)
+            };
 
             table1.add_row(Row::from(vec![
                 Cell::new(issue_number),
                 Cell::new(title),
-                Cell::new(&business_value_content)
+                Cell::new(&value_content)
             ]));
 
-            if business_value_content != "No content found" {
+            // Update the third column header based on value type
+            table1.set_header(vec![
+                "Issue Number",
+                "Title",
+                if show_business_value { "Business Value" } else { "Customer Value" }
+            ]);
+
+            if value_content != "No content found" {
                 business_value_map
-                    .entry(business_value_content.clone())
+                    .entry(value_content.clone())
                     .or_insert_with(Vec::new)
                     .push(issue_number.to_string());
             }
@@ -174,7 +200,10 @@ fn fetch_and_display_tickets(sprint: Option<String>, date_range: Option<String>,
         table2
             .set_content_arrangement(ContentArrangement::Dynamic)
             .set_width(100)
-            .set_header(vec!["Business Value", "Ticket Numbers"]);
+            .set_header(vec![
+                if show_business_value { "Business Value" } else { "Customer Value" },
+                "Ticket Numbers"
+            ]);
 
         for (business_value, ticket_numbers) in business_value_map {
             table2.add_row(Row::from(vec![
@@ -226,5 +255,86 @@ fn extract_business_value_content(description: &str) -> String {
         }
     } else {
         "No content found".to_string()
+    }
+}
+
+fn extract_customer_value_content(description: &str) -> String {
+    let customer_value_regex = regex::Regex::new(r"Business value\s*([\s\S]*?)\s*Customer value").unwrap();
+    if let Some(caps) = customer_value_regex.captures(description) {
+        let content = caps.get(1).map_or("", |m| m.as_str()).trim();
+        if content.contains("<>") {
+            "No content found".to_string()
+        } else {
+            content.to_string()
+        }
+    } else {
+        "No content found".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_business_value_content() {
+        // Test valid business value extraction
+        let description = "Some text\nBusiness value\nThis is the business value\nCustomer value\nMore text";
+        assert_eq!(
+            extract_business_value_content(description),
+            "This is the business value"
+        );
+
+        // Test when no business value section exists
+        let description = "Some text without business value section";
+        assert_eq!(
+            extract_business_value_content(description),
+            "No content found"
+        );
+
+        // Test when business value contains <>
+        let description = "Business value\n<>\nCustomer value";
+        assert_eq!(
+            extract_business_value_content(description),
+            "No content found"
+        );
+
+        // Test with extra whitespace
+        let description = "Business value    \n   Some value   \n   Customer value";
+        assert_eq!(
+            extract_business_value_content(description),
+            "Some value"
+        );
+    }
+
+    #[test]
+    fn test_extract_customer_value_content() {
+        // Test valid business value extraction
+        let description = "Some text\nBusiness value\nThis is the business value\nCustomer value\nMore text";
+        assert_eq!(
+            extract_customer_value_content(description),
+            "This is the business value"
+        );
+
+        // Test when no business value section exists
+        let description = "Some text without business value section";
+        assert_eq!(
+            extract_customer_value_content(description),
+            "No content found"
+        );
+
+        // Test when business value contains <>
+        let description = "Business value\n<>\nCustomer value";
+        assert_eq!(
+            extract_customer_value_content(description),
+            "No content found"
+        );
+
+        // Test with extra whitespace
+        let description = "Business value    \n   Some value   \n   Customer value";
+        assert_eq!(
+            extract_customer_value_content(description),
+            "Some value"
+        );
     }
 }
